@@ -1,0 +1,298 @@
+import * as functions from "firebase-functions/v2";
+import * as admin from "firebase-admin";
+
+// Wymagane by operacje w db dziaay
+if (!admin.apps.length) {
+  admin.initializeApp();
+}
+
+/**
+ * Zapisuje konfiguracj Apilo do bazy danych.
+ */
+export const saveApiloIntegration = functions.https.onCall(async (request) => {
+  if (!request.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated.");
+  }
+
+  const { companyId, customName, apiUrl, clientId, clientSecret, authCode, isDefault } = request.data;
+
+  if (!companyId || !apiUrl || !clientId || !clientSecret || !authCode) {
+    throw new functions.https.HttpsError("invalid-argument", "Missing required fields: companyId, apiUrl, clientId, clientSecret, authCode");
+  }
+
+  try {
+    const integrationData = {
+      orgId: companyId,
+      type: "apilo",
+      customName: customName || "Apilo",
+      status: "active",
+      isDefault: isDefault || false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdBy: request.auth.uid,
+      syncStatus: "idle",
+      apiUrl: apiUrl.trim(),
+      clientId: clientId.trim(),
+      clientSecret: clientSecret.trim(),
+      authCode: authCode.trim()
+    };
+
+    const docRef = await admin.firestore()
+      .collection(`companies/${companyId}/integrations`)
+      .add(integrationData);
+
+    // Jeli to jest default, usu flag z innych
+    if (isDefault) {
+      const snap = await admin.firestore()
+        .collection(`companies/${companyId}/integrations`)
+        .where("id", "!=", docRef.id)
+        .where("isDefault", "==", true)
+        .get();
+
+      const batch = admin.firestore().batch();
+      snap.forEach(doc => {
+        batch.update(doc.ref, { isDefault: false });
+      });
+      await batch.commit();
+    }
+
+    return { success: true, integrationId: docRef.id };
+  } catch (error: any) {
+    console.error("Error saving Apilo integration:", error);
+    throw new functions.https.HttpsError("internal", error.message);
+  }
+});
+
+/**
+ * Testuje poczenie z API Apilo uywajc podanych kluczy.
+ */
+export const testApiloIntegration = functions.https.onCall(async (request) => {
+  if (!request.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated.");
+  }
+
+  const { companyId, integrationId } = request.data;
+  if (!companyId || !integrationId) {
+    throw new functions.https.HttpsError("invalid-argument", "Missing companyId or integrationId");
+  }
+
+  try {
+    const docSnap = await admin.firestore()
+      .doc(`companies/${companyId}/integrations/${integrationId}`)
+      .get();
+
+    if (!docSnap.exists) {
+      throw new functions.https.HttpsError("not-found", "Integration not found.");
+    }
+
+    const data = docSnap.data();
+    if (!data || data.type !== "apilo") {
+      throw new functions.https.HttpsError("invalid-argument", "Integration is not Apilo type.");
+    }
+
+    const { apiUrl, clientId, clientSecret, authCode, refreshToken } = data;
+
+    if (!apiUrl || !clientId || !clientSecret) {
+      throw new functions.https.HttpsError("failed-precondition", "Missing API credentials in integration doc.");
+    }
+
+    if (!authCode && !refreshToken) {
+      throw new functions.https.HttpsError("failed-precondition", "Missing authCode or refreshToken.");
+    }
+
+    // Wykonanie dania autoryzacyjnego do Apilo
+    const tokenUrl = `${apiUrl.replace(/\/$/, '')}/rest/auth/token/`;
+    const authHeader = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+    
+    // Budujemy body do autoryzacji
+    const bodyParams: any = {};
+    if (authCode) {
+      bodyParams.grantType = "authorization_code";
+      bodyParams.token = authCode;
+    } else if (refreshToken) {
+      bodyParams.grantType = "refresh_token";
+      bodyParams.token = refreshToken;
+    }
+    
+    const response = await fetch(tokenUrl, {
+      method: "POST",
+      headers: {
+        "Authorization": `Basic ${authHeader}`,
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+      },
+      body: JSON.stringify(bodyParams)
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      console.error(`Apilo API Error [${response.status}]:`, errBody);
+      return { success: false, error: `Bd autoryzacji Apilo. Sprawd poprawno danych. Kod: ${response.status}` };
+    }
+
+    const tokenData = await response.json();
+    if (!tokenData.accessToken) {
+      return { success: false, error: "Brak tokenu w odpowiedzi Apilo." };
+    }
+
+    // Aktualizacja statusu
+    const updates: any = {
+      lastTestAt: admin.firestore.FieldValue.serverTimestamp(),
+      lastSuccessAt: admin.firestore.FieldValue.serverTimestamp(),
+      status: "active"
+    };
+
+    if (tokenData.refreshToken) {
+      updates.refreshToken = tokenData.refreshToken;
+    }
+    
+    // Usuwamy jednorazowy authCode po udanym uyciu, zastpujemy go refresh_tokenem
+    if (authCode) {
+      updates.authCode = admin.firestore.FieldValue.delete();
+    }
+
+    await admin.firestore()
+      .doc(`companies/${companyId}/integrations/${integrationId}`)
+      .update(updates);
+
+    return { success: true, message: "Poczono pomylnie z Apilo." };
+  } catch (error: any) {
+    console.error("Error testing Apilo integration:", error);
+    throw new functions.https.HttpsError("internal", error.message);
+  }
+});
+
+/**
+ * Pobiera wiey token dostpowy do Apilo uywajc refreshToken.
+ */
+async function getApiloAccessToken(integrationData: any, docRef: any) {
+  const { apiUrl, clientId, clientSecret, refreshToken } = integrationData;
+  if (!refreshToken) throw new Error("Brak refreshToken w integracji Apilo");
+
+  const tokenUrl = \\/rest/auth/token/\;
+  const authHeader = Buffer.from(\\:\\).toString('base64');
+  
+  const response = await fetch(tokenUrl, {
+    method: "POST",
+    headers: {
+      "Authorization": \Basic \\,
+      "Content-Type": "application/json",
+      "Accept": "application/json"
+    },
+    body: JSON.stringify({
+      grantType: "refresh_token",
+      token: refreshToken
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(\Bd odwieania tokena Apilo: \\);
+  }
+
+  const tokenData = await response.json();
+  if (tokenData.refreshToken && tokenData.refreshToken !== refreshToken) {
+    await docRef.update({ refreshToken: tokenData.refreshToken, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+  }
+
+  return tokenData.accessToken;
+}
+
+/**
+ * Funkcja wywoywana rcznie (np. przyciskiem "Pobierz zamwienia") lub z crona.
+ */
+export const syncApiloOrders = functions.https.onCall(async (request) => {
+  if (!request.auth) {
+    throw new functions.https.HttpsError("unauthenticated", "User must be authenticated.");
+  }
+
+  const { companyId, integrationId } = request.data;
+  if (!companyId || !integrationId) {
+    throw new functions.https.HttpsError("invalid-argument", "Missing parameters");
+  }
+
+  try {
+    const docRef = admin.firestore().doc(\companies/\/integrations/\\);
+    const docSnap = await docRef.get();
+
+    if (!docSnap.exists) throw new Error("Integration not found");
+    const integrationData = docSnap.data() as any;
+
+    const accessToken = await getApiloAccessToken(integrationData, docRef);
+
+    // Pobierz z API
+    const apiUrl = \\/rest/api/orders/\;
+    const response = await fetch(apiUrl, {
+      method: "GET",
+      headers: {
+        "Authorization": \Bearer \\,
+        "Accept": "application/json"
+      }
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("Apilo orders fetch error:", errText);
+      throw new Error(\Bd pobierania zamwie z Apilo: \\);
+    }
+
+    const apiloData = await response.json();
+    const ordersList = apiloData.orders || [];
+
+    let importedCount = 0;
+    const batch = admin.firestore().batch();
+
+    for (const apiloOrder of ordersList) {
+      const orderRef = admin.firestore().collection(\companies/\/orders\).doc(\pilo_\\);
+      
+      // Mapowanie adresu
+      const addr = apiloOrder.addressCustomer || {};
+      const buyerName = \\ \\.trim() || apiloOrder.customerName || 'Nieznany klient';
+      
+      const mappedOrder = {
+        orgId: companyId,
+        source: "APILO",
+        sourceId: String(apiloOrder.id),
+        status: "NEW", // Wymaga mapowania na nasze statusy
+        createdAt: apiloOrder.createdAt ? new Date(apiloOrder.createdAt) : admin.firestore.FieldValue.serverTimestamp(),
+        importedAt: admin.firestore.FieldValue.serverTimestamp(),
+        integrationId: integrationId,
+        
+        buyer: {
+          name: buyerName,
+          email: addr.email || apiloOrder.customerEmail || '',
+          phone: addr.phone || apiloOrder.customerPhone || '',
+        },
+        delivery: {
+          address: {
+            street: addr.street || '',
+            city: addr.city || '',
+            postalCode: addr.zipCode || '',
+            countryCode: addr.country || 'PL',
+          },
+          method: apiloOrder.carrierId ? \ApiloCarrier_\\ : 'kurier'
+        },
+        financials: {
+          total: Number(apiloOrder.totalAmount || 0),
+          currency: apiloOrder.originalCurrency || 'PLN',
+          paid: apiloOrder.paymentStatus === 2 || apiloOrder.paymentStatus === 3 // 2=paid, 3=overpayment
+        },
+        items: (apiloOrder.orderItems || []).map((item: any) => ({
+          sku: item.sku || 'UNKNOWN',
+          name: item.originalName || item.name || 'Produkt z Apilo',
+          quantity: item.quantity || 1,
+          price: Number(item.originalPriceWithTax || 0)
+        }))
+      };
+
+      batch.set(orderRef, mappedOrder, { merge: true });
+      importedCount++;
+    }
+
+    await batch.commit();
+
+    return { success: true, count: importedCount };
+  } catch (err: any) {
+    console.error("syncApiloOrders Error:", err);
+    throw new functions.https.HttpsError("internal", err.message);
+  }
+});
