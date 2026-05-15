@@ -1,0 +1,306 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // --- Helper Functions ---
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isSuperadmin() {
+      let userRef = /databases/$(database)/documents/users/$(request.auth.uid);
+      let platformUserRef = /databases/$(database)/documents/platformUsers/$(request.auth.uid);
+      
+      let isLegacyAdmin = exists(userRef) && (
+        get(userRef).data.globalRole == 'superadmin' || 
+        get(userRef).data.role == 'superadmin' ||
+        get(userRef).data.globalRole == 'admin' || 
+        get(userRef).data.role == 'admin'
+      );
+      
+      let isPlatformAdmin = exists(platformUserRef) && (
+        get(platformUserRef).data.role == 'SUPER_ADMIN'
+      );
+      
+      return isAuthenticated() && (isLegacyAdmin || isPlatformAdmin);
+    }
+    
+    function isOperativeAdmin() {
+      let platformUserRef = /databases/$(database)/documents/platformUsers/$(request.auth.uid);
+      return isAuthenticated() && exists(platformUserRef) && get(platformUserRef).data.role == 'ADMIN_OPERACYJNY';
+    }
+
+    function isCompanyMember(companyId) {
+      return isAuthenticated() && exists(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid));
+    }
+    
+    function isPlatformRole(roleName) {
+      let platformUserRef = /databases/$(database)/documents/platformUsers/$(request.auth.uid);
+      return isAuthenticated() && exists(platformUserRef) && get(platformUserRef).data.role == roleName;
+    }
+
+    // --- Collection: system (Counters & Meta) ---
+    match /system/{docId} {
+      allow read, write: if isAuthenticated();
+    }
+
+    // --- FAZA 1a GKP ---
+    match /globalIntegrations/{integrationId} {
+      allow read, write: if false; // Tylko Admin SDK (Cloud Functions)
+    }
+    match /globalIntegrationsAudit/{auditId} {
+      allow read, write: if false; // Tylko Admin SDK
+    }
+
+    // --- Collection: warehouses ---
+    match /warehouses/{warehouseId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperadmin();
+    }
+
+    // --- Collection: platformUsers ---
+    match /platformUsers/{userId} {
+      allow read: if isSuperadmin() || isOperativeAdmin() || request.auth.uid == userId;
+      allow update: if isSuperadmin() || isOperativeAdmin() || (request.auth.uid == userId && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastLoginAt']));
+      allow create, delete: if isSuperadmin() || isOperativeAdmin();
+    }
+
+    // --- Collection: users ---
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if isSuperadmin() || (isAuthenticated() && request.auth.uid == userId);
+    }
+
+    // --- Collection: companies ---
+    match /companies/{companyId} {
+      // Superadmin can do everything, standard user can read/create/update if they are a member
+      allow create: if isAuthenticated();
+      allow read: if isSuperadmin() || isCompanyMember(companyId);
+      allow update, delete: if isSuperadmin() || isCompanyMember(companyId);
+      
+      // Subcollection: members
+      match /members/{memberUid} {
+        allow read: if isSuperadmin() || isAuthenticated(); 
+        allow write: if isSuperadmin() || isCompanyMember(companyId) || request.auth.uid == memberUid;
+      }
+      
+      // Subcollection: invites
+      match /invites/{inviteId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: audit_logs
+      match /audit_logs/{logId} {
+        allow create: if isAuthenticated();
+        allow read, update, delete: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: integrations
+      match /integrations/{integrationId} {
+        allow read: if request.auth != null && (
+          exists(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)) ||
+          isSuperadmin() || 
+          isOperativeAdmin()
+        );
+        allow write: if request.auth != null && (
+          exists(/databases/$(database)/documents/companies/$(companyId)/members/$(request.auth.uid)) ||
+          isSuperadmin() || 
+          isOperativeAdmin()
+        );
+      }
+      
+      // Subcollection: products
+      match /products/{productId} {
+        allow read: if isSuperadmin() || isCompanyMember(companyId);
+
+        // Nowe produkty muszą być tworzone jako aktywne.
+        // Archiwizacja wyłącznie przez Cloud Function archiveProduct (Admin SDK).
+        allow create: if (isSuperadmin() || isCompanyMember(companyId))
+          && request.resource.data.get('isArchived', false) == false
+          && request.resource.data.get('archivedAt', null) == null
+          && request.resource.data.get('archivedBy', null) == null;
+
+        // Pola archiwizacji mogą być zmieniane tylko przez Admin SDK (Cloud Functions).
+        // archiveProduct/unarchiveProduct używają update przez Admin SDK — omijają tę regułę.
+        allow update: if isSuperadmin()
+          || (isCompanyMember(companyId)
+              && !request.resource.data.diff(resource.data)
+                  .affectedKeys()
+                  .hasAny(['isArchived', 'archivedAt', 'archivedBy']));
+
+        // TODO(2c): zmienić na `if isSuperadmin()` po zastąpieniu deleteDoc archiveProduct w UI.
+        // Tymczasowo member może delete żeby nie blokować istniejącego przycisku "Usuń".
+        allow delete: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: syncJobs
+      match /syncJobs/{jobId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: integrationSyncJobs
+      match /integrationSyncJobs/{jobId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: orders
+      match /orders/{orderId} {
+        allow read: if isSuperadmin() || isCompanyMember(companyId) || isPlatformRole('WAREHOUSE');
+        allow write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: orderItems
+      match /orderItems/{itemId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: orderActivityLogs
+      match /orderActivityLogs/{logId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: shipments (DHL DE, etc.)
+      match /shipments/{shipmentId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: shipmentsArchive
+      match /shipmentsArchive/{shipmentId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: stats (Company Stats like shipment counters)
+      match /stats/{statId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: pricing (Client Pricing)
+      match /pricing/{pricingId} {
+        allow read: if isSuperadmin() || isCompanyMember(companyId);
+        allow write: if false; // Only via Cloud Functions
+      }
+      
+      // Subcollection: stockReservations
+      match /stockReservations/{resId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Subcollection: system (e.g. orderSequence)
+      match /system/{docId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+
+      // Fulfillment Subcollections
+      match /fulfillmentQueue/{taskId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      match /pickWaves/{waveId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      match /packingStations/{stationId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      match /cartons/{cartonId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      match /inventoryExceptions/{exceptionId} {
+        allow read, write: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      // Warehouse & Fulfillment Core Subcollections
+      match /inboundShipments/{shipmentId} {
+        allow read, delete: if isSuperadmin() || isCompanyMember(companyId);
+        
+        match /items/{itemId} {
+          allow read, delete: if isSuperadmin() || isCompanyMember(companyId);
+        }
+      }
+
+      match /outboundShipments/{shipmentId} {
+        allow read, delete: if isSuperadmin() || isCompanyMember(companyId);
+        
+        match /items/{itemId} {
+          allow read, delete: if isSuperadmin() || isCompanyMember(companyId);
+        }
+      }
+      
+      match /warehouseAccess/{warehouseId} {
+        allow read: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      match /warehouseLocations/{locId} {
+        allow read: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      match /inventoryStock/{stockId} {
+        allow read: if isSuperadmin() || isCompanyMember(companyId);
+      }
+      
+      match /inventoryMovements/{movId} {
+        allow read: if isSuperadmin() || isCompanyMember(companyId);
+      }
+    }
+
+    // --- Collection Group: members ---
+    // Specifically targets ANY 'members' subcollection query globally (like AdminUsers)
+    match /{path=**}/members/{memberUid} {
+      allow read: if isSuperadmin() || request.auth.uid == memberUid;
+    }
+
+    // --- Collection Group: inboundShipments ---
+    match /{path=**}/inboundShipments/{shipmentId} {
+      allow read: if isSuperadmin();
+    }
+
+    // --- Collection Group: outboundShipments ---
+    match /{path=**}/outboundShipments/{shipmentId} {
+      allow read: if isSuperadmin();
+    }
+
+    // --- Collection Group: inventoryStock ---
+    match /{path=**}/inventoryStock/{stockId} {
+      allow read: if isSuperadmin();
+    }
+
+    // --- Collection Group: fulfillmentQueue ---
+    match /{path=**}/fulfillmentQueue/{taskId} {
+      allow read: if isSuperadmin() || isPlatformRole('WAREHOUSE');
+    }
+
+    // --- Collection Group: pickWaves ---
+    match /{path=**}/pickWaves/{waveId} {
+      allow read: if isSuperadmin() || isPlatformRole('WAREHOUSE');
+    }
+
+    // --- Collection Group: shipments ---
+    match /{path=**}/shipments/{shipmentId} {
+      allow read: if isSuperadmin();
+    }
+
+    // === BILLING — Carrier Contracts (super-admin only) ===
+    match /carriers/{carrierId} {
+      allow read: if isAuthenticated();  // wszyscy zalogowani mogą zobaczyć listę kurierów
+      allow write: if false;  // pisanie tylko przez Cloud Function (jako admin)
+      
+      match /surcharges/{month} {
+        allow read: if isAuthenticated();
+        allow write: if false;
+      }
+    }
+    match /carrierContracts/{contractId} {
+      // Tylko super-admin czyta szczegóły kontraktu (zawiera linki do PDF)
+      allow read: if isSuperadmin();
+      allow write: if false;  // tylko przez Cloud Function
+      match /priceLists/{priceListId} {
+        allow read: if isSuperadmin();
+        allow write: if false;
+      }
+    }
+    match /surchargeAlerts/{alertId} {
+      allow read: if isSuperadmin();
+      allow write: if false;
+    }
+  }
+}

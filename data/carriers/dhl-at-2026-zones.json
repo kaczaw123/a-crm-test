@@ -1,0 +1,10 @@
+{
+  "_comment": "TODO super-admin: uzupełnij realne mapowanie krajów per ZONE_1..ZONE_8 z PDF kontraktu DHL AT 2026 (sekcja Annex 2). Aktualnie tylko placeholder.",
+  "ZONE1_EU": ["DE", "BE", "NL", "LU", "DK"],
+  "ZONE1_NONEU": ["GB"],
+  "ZONE2": ["FR", "IT", "ES", "PT"],
+  "ZONE3_EU": ["PL", "CZ", "SK", "HU", "SI", "RO", "BG"],
+  "ZONE4": ["CA"],
+  "ZONE5": ["CN", "JP", "KR"],
+  "ZONE6": ["US", "AU", "NZ"]
+}

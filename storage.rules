@@ -1,0 +1,26 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSuperadmin() {
+      return request.auth != null && (
+        firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role == 'superadmin' ||
+        firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.globalRole == 'superadmin' ||
+        firestore.get(/databases/(default)/documents/platformUsers/$(request.auth.uid)).data.role == 'SUPER_ADMIN' ||
+        firestore.get(/databases/(default)/documents/platformUsers/$(request.auth.uid)).data.role == 'ADMIN_OPERACYJNY'
+      );
+    }
+    
+    function isCompanyMember(companyId) {
+      return request.auth != null && firestore.exists(/databases/(default)/documents/companies/$(companyId)/members/$(request.auth.uid));
+    }
+
+    match /shipments/{companyId}/{allPaths=**} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+    match /temp/{companyId}/{allPaths=**} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+  }
+}
